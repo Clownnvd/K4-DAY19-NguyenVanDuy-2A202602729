@@ -23,7 +23,7 @@ PROVIDERS = {
     "openrouter": {"key": "OPENROUTER_API_KEY", "base_url": "https://openrouter.ai/api/v1",
                    "chat": "openai/gpt-4o-mini", "embed": "openai/text-embedding-3-small"},
     "gemini": {"key": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-               "chat": "gemini-2.5-flash-lite", "embed": "gemini-embedding-001"},
+               "chat": "gemini-3.5-flash-lite", "embed": "gemini-embedding-2"},
     "anthropic": {"key": "ANTHROPIC_API_KEY", "base_url": None,
                   "chat": "claude-opus-5-5", "embed": None},
 }
@@ -36,8 +36,8 @@ PRICES_PER_M = {
     "gpt-4.1-nano": (0.10, 0.40),
     "text-embedding-3-small": (0.02, 0.0),
     "text-embedding-3-large": (0.13, 0.0),
-    "gemini-2.5-flash-lite": (0.10, 0.40),
-    # Gemini embedding pricing intentionally omitted: the current pricing page does not list gemini-embedding-001.
+    "gemini-3.5-flash-lite": (0.30, 2.50),
+    "gemini-embedding-2": (0.20, 0.0),
     "claude-opus-5-5": (4.00, 20.00),
     "claude-sonnet-5-5": (2.00, 10.00),
     "claude-haiku-4-5": (1.00, 5.00),
@@ -104,6 +104,8 @@ class MeteredLLM:
         self.embedding_model = f"{self.embed_provider}:{self.embed_model_id}"
         self._backend_name = self.embedding_model
         self.usage = Usage()
+        self._next_chat_at = 0.0
+        self._next_embed_at = 0.0
         self._chat_client: Any
         self._embed_client: Any
         if self.chat_provider == "anthropic":
@@ -119,19 +121,31 @@ class MeteredLLM:
         if self.chat_provider == "anthropic":
             text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
         else:
-            if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    response_format={"type": "json_object"},
-                )
-            else:
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                )
+            from openai import RateLimitError
+
+            # The Gemini free tier currently permits 15 chat requests/minute.
+            # Keep the benchmark reproducible rather than failing midway through
+            # the 20 news articles and 24 answer/judge calls.
+            for attempt in range(5):
+                if self.chat_provider == "gemini":
+                    delay = self._next_chat_at - time.monotonic()
+                    if delay > 0:
+                        time.sleep(delay)
+                    self._next_chat_at = time.monotonic() + 4.5
+                try:
+                    options = {
+                        "model": self.chat_model_id,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0,
+                    }
+                    if json_mode and self.chat_provider != "gemini":
+                        options["response_format"] = {"type": "json_object"}
+                    response = self._chat_client.chat.completions.create(**options)
+                    break
+                except RateLimitError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(min(60.0, 8.0 * (2 ** attempt)))
             text, model = response.choices[0].message.content or "", self.chat_model_id
             usage = response.usage
             tokens_in = usage.prompt_tokens if usage else 0
@@ -158,8 +172,31 @@ class MeteredLLM:
 
     def embed(self, text: str) -> list[float]:
         start = time.perf_counter()
-        response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
-        tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
+        from openai import RateLimitError
+
+        for attempt in range(5):
+            if self.embed_provider == "gemini":
+                # Gemini's free tier permits 100 embedding requests/minute.
+                delay = self._next_embed_at - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                self._next_embed_at = time.monotonic() + 0.75
+            try:
+                response = self._embed_client.embeddings.create(
+                    model=self.embed_model_id, input=text,
+                )
+                break
+            except RateLimitError:
+                if attempt == 4:
+                    raise
+                time.sleep(min(60.0, 15.0 * (2 ** attempt)))
+        tokens = getattr(response.usage, "prompt_tokens", 0) or 0
+        if not tokens and self.embed_provider == "gemini":
+            # Gemini's OpenAI-compatible embedding response omits usage.
+            # Estimate billed input tokens from UTF-8 bytes; five corpus
+            # samples checked with Gemini countTokens ranged 3.56-4.47
+            # bytes/token. The report identifies this as an estimate.
+            tokens = max(1, (len(text.encode("utf-8")) + 2) // 4)
         self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
         return [float(value) for value in response.data[0].embedding]
 
